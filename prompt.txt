@@ -1,0 +1,1 @@
+Describe the video such that it could be recreated by a text-to-video AI, listing the people, animals, or things in the scene, where they are, what their appearance is, what they are doing, how they are interacting, time of day, lighting, or camera perspectives, without making any value judgments. Limit your response to 500 characters.

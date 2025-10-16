@@ -1,0 +1,16 @@
+torch
+torchaudio
+torchvision
+transformers
+qwen-vl-utils
+accelerate
+safetensors
+huggingface-hub
+pillow
+numpy
+protobuf
+packaging
+bitsandbytes
+optimum
+# flashinfer-python
+flash-attn
