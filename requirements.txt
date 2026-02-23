@@ -12,5 +12,3 @@ protobuf
 packaging
 bitsandbytes
 optimum
-# flashinfer-python
-flash-attn

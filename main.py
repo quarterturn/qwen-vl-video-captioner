@@ -39,7 +39,7 @@ def load_model_and_processor():
             enforce_eager=False,
             tensor_parallel_size=torch.cuda.device_count(),
             seed=42,
-            max_model_len=8192,
+            max_model_len=32768,
         )
         print("✓ vLLM FP8 engine loaded!")
     return llm, processor
@@ -47,7 +47,7 @@ def load_model_and_processor():
 def load_prompt() -> str:
     prompt_file = Path("prompt.txt")
     if not prompt_file.exists():
-        default_prompt = "Analyze this 15-second video clip and generate a detailed caption."
+        default_prompt = "Analyze this 20-second video clip and generate a detailed caption."
         prompt_file.write_text(default_prompt)
         print("📝 Created default prompt.txt")
         return default_prompt
