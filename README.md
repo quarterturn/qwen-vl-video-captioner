@@ -26,3 +26,15 @@ Install:
 
 Use:
 ```python3 main.py --input-dir input --output-dir output```
+
+
+BONUS TOOL!
+charcter-cropper.py
+ 
+usage: character-cropper.py [-h] [--input-dir INPUT_DIR] --ref-dir REF_DIR --character-name CHARACTER_NAME [--anime-title ANIME_TITLE]
+                            [--ref-max-size REF_MAX_SIZE] [--output-dir OUTPUT_DIR] [--crop] [--debug] [--limit LIMIT]
+character-cropper.py: error: the following arguments are required: --ref-dir, --character-name
+
+
+How it works:
+This tool uses qwen3-vl to find a character in a video clip using images in REF_DIR. It slides a square bounding box around in the image and crops the video to where the characters face is, if it can find it. This is useful for making a dataset of a specific character.
