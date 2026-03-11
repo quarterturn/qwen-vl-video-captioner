@@ -1,7 +1,22 @@
+# PyTorch nightly for Qwen3.5 compatibility (CUDA 13.0)
+--pre
+--extra-index-url https://download.pytorch.org/whl/nightly/cu130
+
+# Core torch packages (let pip resolve exact nightly versions)
 torch
-torchaudio
 torchvision
-transformers
+torchaudio
+
+# Transformers from main branch (required for qwen3_5 / qwen3_5_moe architectures)
+git+https://github.com/huggingface/transformers.git@main
+
+# vLLM nightly (required for Qwen3.5 support; stable versions don't recognize the arch yet)
+--pre
+--extra-index-url https://wheels.vllm.ai/nightly
+
+vllm
+
+# Other dependencies 
 qwen-vl-utils
 accelerate
 safetensors

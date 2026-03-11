@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Qwen3-VL-30B-A3B Video Character Detector + Optional Square Crop
+Qwen3.5 video Character Detector + Optional Square Crop
 Uses reference images to locate a character in video clips
 Outputs detection JSON with timestamped bounding boxes
 Optionally crops video to a static SQUARE union crop centered on the character
@@ -10,7 +10,6 @@ import os
 import argparse
 import gc
 import json
-import re
 import torch
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -25,13 +24,12 @@ from huggingface_hub import snapshot_download
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
 # Config
-REPO_ID = "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
-LOCAL_MODEL_DIR = Path("models/qwen3-vl-fp8")
+REPO_ID = "Qwen/Qwen3.5-27B-FP8"
+LOCAL_MODEL_DIR = Path("/home/alex/Documents/qwen-vl-video-captioner/models/qwen3.5-27b-fp8")
 
 # Global instances
 llm = None
 processor = None
-
 
 def load_model_and_processor():
     global llm, processor
@@ -54,16 +52,15 @@ def load_model_and_processor():
         llm = LLM(
             model=model_path,
             trust_remote_code=True,
-            gpu_memory_utilization=0.8,
-            enforce_eager=False,
+            gpu_memory_utilization=0.65,
+            enforce_eager=True,
             tensor_parallel_size=torch.cuda.device_count(),
             seed=42,
-            max_model_len=32768,
-            # kv_cache_dtype="fp8_e4m3fn",  # Uncomment for extra memory savings on H100+
+            max_model_len=32768,  # Increased as requested
+            kv_cache_dtype="fp8",  # Uncomment for extra memory savings on H100+
         )
         print("✓ vLLM FP8 engine loaded from local directory!")
     return llm, processor
-
 
 def build_prompt(num_refs: int, character_name: str, anime_title: Optional[str]) -> str:
     refs_part = f"The first {num_refs} images are reference images of the character \"{character_name}\""
@@ -74,65 +71,50 @@ def build_prompt(num_refs: int, character_name: str, anime_title: Optional[str])
     target_part = "The following video clip is the target scene from the same series."
 
     instruction = (
-    "Locate **prominent instances** of this character in the video, but **output at most 10 detections** — even if the character appears more often. "
-    "Select only the clearest, most central, and most varied appearances. "
-    "For each, provide the **tightest possible** bounding box hugging the character's body/head (no large empty space). "
-    "Never output full-frame boxes [0.0, 0.0, 1.0, 1.0] unless the character truly fills the screen."
+        "Locate **every prominent instance** of this character in the video. "
+        "For each distinct appearance, provide the **tightest possible** bounding box that closely fits the character's body/head (do not include large empty space around them). "
+        "Be precise — boxes should hug the character, not the whole frame. "
+        "Account for movement, anime stylization, and partial views, but **never** output full-frame boxes like [0.0, 0.0, 1.0, 1.0] unless the character truly fills the entire image."
     )
 
-    format_guide = """Your ENTIRE response MUST consist ONLY of the following JSON object — nothing else before, after, inside, or around it. No markdown, no ```json fences, no explanations, no extra whitespace, no trailing commas, no incomplete structures. Start immediately with '{' and end immediately with '}'.
+    format_guide = """Your response MUST be ONLY a valid JSON object. Start directly with '{' and end with '}', with no extra characters, whitespace, text, markdown, code blocks, or ``` fences whatsoever.
 
-Strict rules — violate any and the output is invalid:
-- Valid JSON only: proper quotes around strings, commas between items, NO trailing comma after the last array or object item.
-- "character_found": boolean (true or false)
-- "overall_confidence": exactly one of "high", "medium", "low"
-- "detections": array [] of objects, sorted by time_seconds ascending. Empty [] if none found. Include 10–30 entries if the character appears frequently.
-- Each detection object MUST contain exactly these keys:
-  - "time_seconds": float (e.g. 0.5, 1.2) — NEVER string or integer
-  - "bbox_normalized": exactly [x_min, y_min, x_max, y_max] — 4 floats, 0.0 ≤ all values ≤ 1.0, x_min < x_max, y_min < y_max
-  - "confidence": exactly "high", "medium", or "low"
-  - "reason": short string (1 sentence max), no inner quotes, no newlines
-- "reason": short overall explanation string (1 sentence max)
-- Bounding boxes MUST be tight — hug head+body closely, NEVER near-full-frame unless character literally fills screen
-- NO extra fields, NO comments, NO ```, NO text outside the JSON object
+Example of correct output (do not copy this exactly; adapt to the video):
+{
+  "character_found": true,
+  "overall_confidence": "high",
+  "detections": [
+    {
+      "time_seconds": 0.5,
+      "bbox_normalized": [0.35, 0.2, 0.65, 0.8],
+      "confidence": "high",
+      "reason": "Character centered with clear face and body in frame."
+    },
+    {
+      "time_seconds": 1.2,
+      "bbox_normalized": [0.1, 0.3, 0.4, 0.9],
+      "confidence": "medium",
+      "reason": "Partial side view with some occlusion."
+    }
+  ],
+  "reason": "Character appears multiple times with consistent features."
+}
 
-Example (do NOT copy these values — generate your own):
-{"character_found":true,"overall_confidence":"high","detections":[{"time_seconds":0.5,"bbox_normalized":[0.35,0.2,0.65,0.8],"confidence":"high","reason":"Clear centered face and body."}],"reason":"Character appears consistently."}
-"""
+CRITICAL RULES (follow exactly or output will be invalid):
+- "character_found": boolean (true or false).
+- "overall_confidence": string ("high", "medium", or "low").
+- "detections": array of objects, sorted ascending by "time_seconds". Output at least 10–20 if the character appears frequently; empty array [] if none.
+- For each detection:
+  - "time_seconds": float (e.g., 0.5, 2.3).
+  - "bbox_normalized": array of 4 floats strictly between 0.0 and 1.0 [x_min, y_min, x_max, y_max] — NEVER use integers or pixel values; always normalize by dividing by width/height.
+  - "confidence": string ("high", "medium", or "low").
+  - "reason": string (brief one-sentence explanation, no quotes inside).
+- "reason": string (overall brief explanation).
+- Make bboxes as tight as possible: hug the character's head + body; center horizontally on face/body; avoid near-full-frame like [0.0, 0.0, 0.99, 1.0] unless truly screen-filling.
+- Ensure valid JSON: proper commas, no trailing commas in arrays/objects, escaped quotes if needed.
+- ABSOLUTELY NO markdown, ```json, extra text, or explanations outside the JSON. Response starts with '{' and ends with '}'."""
 
     return f"{refs_part}\n\n{target_part}\n\n{instruction}\n\n{format_guide}"
-
-
-def parse_or_repair_json(raw_text: str) -> Dict:
-    """Attempt to clean and parse JSON, with basic repair for common issues."""
-    # Strip common junk
-    cleaned = raw_text.strip()
-    cleaned = re.sub(r'^```json\s*|\s*```$', '', cleaned)
-    cleaned = re.sub(r'^\s*\{', '{', cleaned)
-    cleaned = re.sub(r'\}\s*$', '}', cleaned)
-
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        print(f"  Initial JSON parse failed: {e}")
-
-    # Repair attempts
-    # 1. Remove trailing commas before } or ]
-    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
-    # 2. Quote unquoted keys (very basic)
-    cleaned = re.sub(r'([{\[,])\s*([a-zA-Z_]\w*)\s*:', r'\1"\2":', cleaned)
-    # 3. Fix double commas or missing values (heuristic)
-    cleaned = re.sub(r',,', ',', cleaned)
-
-    try:
-        result = json.loads(cleaned)
-        print("  ✓ JSON repaired and parsed successfully")
-        return result
-    except json.JSONDecodeError:
-        print("  Repair failed — saving raw output for debug")
-        Path("failed_raw_last.txt").write_text(raw_text)
-        return {"parse_error": True, "raw_output": raw_text}
-
 
 def load_and_resize_image(path: Path, max_size: int) -> Any:
     if max_size <= 0:
@@ -150,13 +132,11 @@ def load_and_resize_image(path: Path, max_size: int) -> Any:
         print(f"  ✗ Failed to load reference {path.name}: {e}")
         return None
 
-
 def validate_video(video_path: Path) -> bool:
     cap = cv2.VideoCapture(str(video_path))
     valid = cap.isOpened()
     cap.release()
     return valid
-
 
 def prepare_inputs_for_vllm(messages: list, processor) -> Optional[dict]:
     try:
@@ -191,55 +171,70 @@ def prepare_inputs_for_vllm(messages: list, processor) -> Optional[dict]:
         print(f"  ✗ prepare_inputs failed: {e}")
         return None
 
-
 def normalize_bbox(bbox):
     """Normalize a single bbox if it looks like pixel coordinates"""
     if len(bbox) != 4:
         return None
     coords = [float(c) for c in bbox]
     if max(coords) > 1.1 or any(c > 1.0 for c in coords):
+        # Assume pixel coords; normalize assuming max ~ width/height ≈ 1000
+        # But to be safe, use the largest coord as reference
         ref = max(coords)
         if ref <= 0:
             return None
         return [max(0.0, min(1.0, c / ref)) for c in coords]
-    return [max(0.0, min(1.0, float(c))) for c in bbox]
-
+    return [max(0.0, min(1.0, float(c))) for c in bbox]  # already normalized, just clamp
 
 def compute_square_crop_bbox(detections: List[Dict]) -> Optional[List[float]]:
+    """
+    Full-height square crop, horizontally centered on average character x-center.
+    - Ignores y entirely (crop y=0.0 to 1.0)
+    - Width = height → square
+    - Shifts horizontally to place average center at 0.5
+    """
     centers_x = []
     for d in detections:
         bbox = d.get('bbox_normalized')
         if not (bbox and len(bbox) == 4):
             continue
+
+        # Quick per-bbox normalization / clamping
         try:
             x_min, y_min, x_max, y_max = map(float, bbox)
-            if max(x_min, y_min, x_max, y_max) > 1.1:
-                ref = max(x_max, y_max)
+            if max(x_min, y_min, x_max, y_max) > 1.1:  # looks like pixels
+                ref = max(x_max, y_max)  # rough scale
                 if ref > 0:
                     x_min /= ref
                     x_max /= ref
+            # Clamp
             x_min = max(0.0, min(1.0, x_min))
             x_max = max(0.0, min(1.0, x_max))
+
             if x_max > x_min:
                 center_x = (x_min + x_max) / 2
-                weight = x_max - x_min
+                weight = x_max - x_min  # wider boxes = more reliable/important
                 centers_x.append((center_x, weight))
         except:
-            continue
+            continue  # skip bad entry
 
     if not centers_x:
         print("  No valid x-centers → fallback to frame center")
-        return [0.25, 0.0, 0.75, 1.0]
+        return [0.25, 0.0, 0.75, 1.0]  # mild center crop as safe default
 
+    # Weighted average center (wider boxes count more)
     total_weight = sum(w for _, w in centers_x)
     avg_center_x = sum(cx * w for cx, w in centers_x) / total_weight
+
     print(f"  Average character x-center: {avg_center_x:.3f} (from {len(centers_x)} detections)")
 
+    # Full-height square
     side = 1.0
     half = side / 2.0
+
     crop_x_min = avg_center_x - half
     crop_x_max = avg_center_x + half
 
+    # Shift to stay in bounds
     if crop_x_min < 0:
         crop_x_max += -crop_x_min
         crop_x_min = 0.0
@@ -247,18 +242,21 @@ def compute_square_crop_bbox(detections: List[Dict]) -> Optional[List[float]]:
         crop_x_min -= crop_x_max - 1.0
         crop_x_max = 1.0
 
+    # If still almost full width → force a bit of centering/zoom
     final_width = crop_x_max - crop_x_min
+
     if final_width > 0.98:
-        shrink_to = 0.85
+        # Shrink slightly and re-center
+        shrink_to = 0.85  # adjust: smaller = more zoom
         extra = (1.0 - shrink_to) / 2
         crop_x_min = extra
         crop_x_max = 1.0 - extra
         print(f"  Near-full width → forced shrink to {shrink_to:.2f} width")
 
     crop_bbox = [crop_x_min, 0.0, crop_x_max, 1.0]
-    print(f"  Final crop bbox: {crop_bbox}")
-    return crop_bbox
+    print(f"  Final crop bbox: {crop_bbox} (square, full height, horizontal shift only)")
 
+    return crop_bbox
 
 def crop_video(input_path: Path, output_path: Path, bbox: List[float]):
     cap = cv2.VideoCapture(str(input_path))
@@ -270,12 +268,14 @@ def crop_video(input_path: Path, output_path: Path, bbox: List[float]):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    # bbox is [x_min_norm, 0.0, x_max_norm, 1.0]
     x1 = max(0, int(bbox[0] * width))
     x2 = min(width, int(bbox[2] * width))
-    y1, y2 = 0, height
+    y1 = 0
+    y2 = height
 
     crop_w = x2 - x1
-    crop_h = y2 - y1
+    crop_h = y2 - y1  # = height
 
     print(f"  Horizontal crop: x {x1}→{x2} ({crop_w}px), full height {crop_h}px")
 
@@ -284,7 +284,10 @@ def crop_video(input_path: Path, output_path: Path, bbox: List[float]):
         cap.release()
         return False
 
+    # Force square: use min(crop_w, crop_h) as side length
     side = min(crop_w, crop_h)
+
+    # Re-center the square horizontally within the horizontal crop
     extra_left = (crop_w - side) // 2 if crop_w > side else 0
     x1 += extra_left
     x2 = x1 + side
@@ -300,6 +303,7 @@ def crop_video(input_path: Path, output_path: Path, bbox: List[float]):
         if not ret:
             break
         cropped = frame[y1:y2, x1:x2]
+        # If cropped shape != (side, side), pad with black (rare here)
         if cropped.shape[1] != side or cropped.shape[0] != side:
             padded = np.zeros((side, side, 3), dtype=np.uint8)
             padded[:cropped.shape[0], :cropped.shape[1]] = cropped
@@ -312,10 +316,9 @@ def crop_video(input_path: Path, output_path: Path, bbox: List[float]):
     print(f"  ✓ Cropped {frame_count} frames to square {side}x{side}")
     return True
 
-
 def process_single_video(video_path: Path, ref_images: List[Any], prompt: str, processor, debug: bool = False) -> Optional[Dict]:
     if not validate_video(video_path):
-        print(f"  ✗ Invalid video: {video_path.name}")
+        print("  ✗ Invalid video: {video_path.name}")
         return None
 
     abs_video = str(video_path.absolute())
@@ -339,8 +342,8 @@ def process_single_video(video_path: Path, ref_images: List[Any], prompt: str, p
 
     try:
         sampling_params = SamplingParams(
-            temperature=0.05,       # Even lower for stricter JSON adherence
-            max_tokens=2048,        # Should be plenty — prevents runaway generation
+            temperature=0.1,      # Lower for more consistent JSON
+            max_tokens=4096,      # Increased to prevent cutoff
             top_p=0.7,
             repetition_penalty=1.0,
         )
@@ -349,9 +352,31 @@ def process_single_video(video_path: Path, ref_images: List[Any], prompt: str, p
         raw_text = outputs[0].outputs[0].text.strip()
 
         if debug:
-            print(f"  Raw model output:\n{raw_text[:500]}...")
+            print(f"  Raw model output: {raw_text}")
 
-        result = parse_or_repair_json(raw_text)
+        try:
+            # Strip common markdown fences and whitespace
+            cleaned = raw_text.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:].strip()          # remove ```json
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:].strip()
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3].strip()
+
+            # Optional: find first { and last } to extract inner JSON if there's junk
+            start = cleaned.find('{')
+            end = cleaned.rfind('}') + 1
+            if start != -1 and end != -1:
+                cleaned = cleaned[start:end]
+
+            result = json.loads(cleaned)
+            print("  ✓ JSON parsed successfully (after cleaning)")
+
+        except json.JSONDecodeError as e:
+            print(f"  ✗ JSON parsing failed: {e}")
+            print(f"  Raw output snippet: {raw_text[:300]}...")  # for debugging
+            result = {"raw_output": raw_text, "parse_error": True}
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -361,7 +386,6 @@ def process_single_video(video_path: Path, ref_images: List[Any], prompt: str, p
     except Exception as e:
         print(f"  ✗ vLLM generation failed: {e}")
         return None
-
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-VL Video Character Detector + Square Crop")
@@ -433,7 +457,6 @@ def main():
                 json_path = args.output_dir / f"{video.stem}_detection.json"
                 if "parse_error" in result:
                     json_path.with_suffix(".txt").write_text(result.get("raw_output", ""))
-                    print("  ✗ Saved raw failed output")
                 else:
                     detections = result.get("detections", [])
                     crop_bbox = compute_square_crop_bbox(detections) if detections else None
@@ -450,12 +473,12 @@ def main():
                     if args.crop and found and crop_bbox:
                         cropped_path = args.output_dir / "cropped" / f"{video.stem}_cropped_square.mp4"
                         if crop_video(video, cropped_path, crop_bbox):
-                            crop_size = int((crop_bbox[2] - crop_bbox[0]) * 100)
+                            crop_size = int((crop_bbox[2] - crop_bbox[0]) * 100)  # rough % for log
                             print(f"  ✓ Square cropped video saved ({crop_size}% side): {cropped_path.name}")
                         else:
-                            print("  ✗ Failed to crop (invalid bbox)")
+                            print(f"  ✗ Failed to crop (invalid bbox)")
             else:
-                print("  ✗ Failed")
+                print(f"  ✗ Failed")
 
         print(f"\n🎉 Complete! {success_count}/{len(video_files)} successful detections")
 
@@ -464,7 +487,6 @@ def main():
     finally:
         gc.collect()
         torch.cuda.empty_cache()
-
 
 if __name__ == "__main__":
     main()
